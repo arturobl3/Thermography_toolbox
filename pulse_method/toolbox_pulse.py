@@ -283,9 +283,9 @@ class thermograms:
         return phasegram, magnitude
 
     
-    def PCT(self,data, n_components=None):
+    def PCT(self, data, n_components=10):
         """
-        Principal Component Thermography (PCT) via SVD.
+        Principal Component Thermography (PCT) via SVD (NumPy version).
         
         Args:
             data: 3D array (N_frames, H, W) - Thermal sequence.
@@ -296,97 +296,112 @@ class thermograms:
             s: Singular values (n_components,).
         """
         N, H, W = data.shape
-        
-        # Reshape and standardize
-        data_flat = data.reshape(N, -1).T  # (H*W, N)
-        data_flat = (data_flat - np.mean(data_flat, axis=0)) / np.std(data_flat, axis=0, where=(np.std(data_flat, axis=0) != 0))
-        
+
+        # Flatten to (N, H*W): samples x features
+        data_flat = data.reshape(N, -1)
+
+        # Mean-center features (column-wise)
+        mean = np.mean(data_flat, axis=0, keepdims=True)
+        data_centered = data_flat - mean
+
         # SVD
-        U, s, Vh = svd(data_flat, full_matrices=False)
-        
-        # Reshape EOFs and limit components
-        EOFs = U.T.reshape(-1, H, W)  # (N, H, W)
-        if n_components is not None:
-            EOFs = EOFs[:n_components]
-            s = s[:n_components]
-        
+        U, s, Vh = svd(data_centered, full_matrices=False)  # Vh: (N, H*W)
+
+        # Principal directions = Vh (rows are principal components)
+        EOFs = Vh[:n_components].reshape(-1, H, W) if n_components else Vh.reshape(-1, H, W)
+
+        # Truncate singular values
+        s = s[:n_components] if n_components else s
+
         return EOFs, s
     
-    def PCT_torch(self, data, n_components=None, fast_svd=True):
+    def PCT_torch(self, data, n_components=10, fast_svd=False):
         """
         Principal Component Thermography (PCT) via SVD (PyTorch version).
         
         Args:
-            data: 3D tensor (N_frames, H, W) or array - Thermal sequence.
-            n_components: Number of principal components to return. If None, returns all.
-            fast_svd: If True, uses randomized SVD (faster but approximate). Default: True.
-            
+            data: 3D tensor (N_frames, H, W) - Thermal sequence.
+            n_components: Number of principal components to return.
+            fast_svd: Use randomized SVD.
+        
         Returns:
-            EOFs: Empirical Orthogonal Functions (n_components, H, W).
+            EOFs: Spatial modes (n_components, H, W).
             s: Singular values (n_components,).
         """
-        # Input handling
         if not isinstance(data, torch.Tensor):
             data = torch.tensor(data, dtype=torch.float32)
-        
-        N, H, W = data.shape
-        
-        # Reshape with memory optimization
-        data_flat = data.reshape(N, -1).T.contiguous()  # (H*W, N)
-        
-        # Standardization with zero-std protection
-        mean = torch.mean(data_flat, dim=0)
-        std = torch.std(data_flat, dim=0)
-        std[std == 0] = 1.0
-        data_flat = (data_flat - mean) / std
-        
-        # SVD computation
-        with torch.no_grad():  # Disable gradients if not needed
+
+        T, H, W = data.shape
+
+        # Flatten to (T, H*W): samples x features
+        data_flat = data.view(T, -1)  # shape (T, H*W)
+
+        # Subtract mean from each column (feature-wise centering)
+        mean = data_flat.mean(dim=0, keepdim=True)
+        data_centered = data_flat - mean
+
+        # Perform SVD
+        with torch.no_grad():
             if fast_svd:
-                q = min(n_components or 10, min(data_flat.shape))
-                U, s, V = torch.svd_lowrank(data_flat, q=q)
+                q = min(n_components or 10, min(data_centered.shape))
+                U, s, V = torch.svd_lowrank(data_centered, q=q)
             else:
-                U, s, V = torch.linalg.svd(data_flat, full_matrices=False)
+                U, s, Vh = torch.linalg.svd(data_centered, full_matrices=False)
+
+        # Vh has shape (T, H*W) → spatial EOFs are rows of Vh
+        EOFs = Vh[:n_components].view(n_components, H, W)
+
+        return EOFs, s[:n_components]
         
-        # Reshape and truncate
-        EOFs = U.T.reshape(-1, H, W)
-        if n_components is not None:
-            EOFs = EOFs[:n_components]
-            s = s[:n_components]
-        
-        return EOFs, s
-        
-    def TSR(self,data,polynomial_order=7):
+    def TSR(self, data, polynomial_order=7):
         """
-        Thermographic Signal Reconstruction (TSR) via logarithmic polynomial fitting.
+        Thermographic Signal Reconstruction (TSR) via logarithmic polynomial fitting (NumPy version).
         
         Args:
             data: 3D array (N_frames, H, W) - Thermal sequence.
-            polynomial_order: Order of the polynomial (e.g., 2 for quadratic).
+            polynomial_order: Order of the polynomial (e.g., 7).
             
         Returns:
             coefficient_matrix: Shape (polynomial_order + 1, H, W).
                 Each [k, i, j] contains the k-th coefficient for pixel (i, j).
                 Order: [highest_order, ..., constant_term].
-            reconstructed: Shape (N_frames, H, W) - Reconstructed thermal decays
+            reconstructed: Shape (N_frames, H, W) - Reconstructed thermal decays.
         """
         N, H, W = data.shape
-        x = np.arange(1, N + 1)  # Time vector (1, 2, ..., N)
+
+        # Time vector and normalized logarithm
+        x = np.arange(1, N + 1)
         x_log = np.log(x)
-        
-        # Avoid log(0) by adding a small offset to data
-        data_log = np.log(data + 1e-10)  # Shape (N, H, W)
-        
-        # Reshape for vectorized fitting (combine spatial dimensions)
-        data_log_flat = data_log.reshape(N, H * W)  # Shape (N, H*W)
-        
-        # Fit polynomial for all pixels at once
-        coefficients_flat = np.polyfit(x_log, data_log_flat, polynomial_order)  # Shape (order+1, H*W)
-        
-        # Reshape back to (order+1, H, W)
+        x_log = (x_log - np.mean(x_log)) / np.std(x_log)
+
+        # Safe log-transform of data
+        data_log = np.log(data + 1e-10)  # Shape: (N, H, W)
+        data_log_flat = data_log.reshape(N, -1)  # Shape: (N, H*W)
+
+        # Polynomial fit for all pixels (axis=0: time)
+        coefficients_flat = np.polyfit(x_log, data_log_flat, polynomial_order)  # Shape: (order+1, H*W)
+
+        # Reshape coefficients to (order+1, H, W)
         coefficient_matrix = coefficients_flat.reshape(polynomial_order + 1, H, W)
 
-        return coefficient_matrix
+        # Reconstruct log-domain signal
+        X_rebuild = np.stack([x_log**(polynomial_order - i) for i in range(polynomial_order + 1)], axis=1)  # (N, order+1)
+        reconstructed_log = X_rebuild @ coefficients_flat  # (N, H*W)
+
+        # Convert back from log-domain to normal
+        reconstructed = np.exp(reconstructed_log).reshape(N, H, W)  # (N, H, W)
+
+        # Compute R² map
+        y_true = data_log_flat  # (N, H*W)
+        y_pred = reconstructed_log
+        ss_res = np.sum((y_true - y_pred)**2, axis=0)
+        ss_tot = np.sum((y_true - np.mean(y_true, axis=0))**2, axis=0)
+        r2_flat = 1 - (ss_res / (ss_tot + 1e-12))
+        r2_map = r2_flat.reshape(H, W)
+
+
+
+        return coefficient_matrix, reconstructed,r2_map
     
 
     def TSR_torch(self, data, polynomial_order=7):
@@ -401,6 +416,7 @@ class thermograms:
             coefficient_matrix: Shape (polynomial_order + 1, H, W).
                 Each [k, i, j] contains the k-th coefficient for pixel (i, j).
                 Order: [highest_order, ..., constant_term].
+            reconstructed: Denoised thermal sequence (N_frames, H, W).
         """
         # Ensure input is a tensor
         if not isinstance(data, torch.Tensor):
@@ -408,28 +424,38 @@ class thermograms:
         
         N, H, W = data.shape
         
-        # Time vector and logarithmic terms
-        x = torch.arange(1, N + 1, device=data.device)  # (N,)
+        # Time vector and normalized log
+        x = torch.arange(1, N + 1, device=data.device, dtype=data.dtype)  # (N,)
         x_log = torch.log(x)
-        
-        # Avoid log(0) with small offset
+        x_log = (x_log - x_log.mean()) / x_log.std()
+
+        # Log-transform thermal data
         data_log = torch.log(data + 1e-10)  # (N, H, W)
-        
-        # Reshape for batched solving (combine spatial dimensions)
-        data_log_flat = data_log.reshape(N, H * W)  # (N, H*W)
-        
-        # Construct Vandermonde matrix for polynomial basis
-        X = torch.stack([x_log ** (polynomial_order - i) for i in range(polynomial_order + 1)], dim=1)  # (N, order+1)
-        
-        # Solve least squares: X^T X coeffs = X^T y
-        XtX = X.T @ X  # (order+1, order+1)
-        Xty = X.T @ data_log_flat  # (order+1, H*W)
-        coefficients_flat = torch.linalg.solve(XtX, Xty)  # (order+1, H*W)
-        
-        # Reshape to (order+1, H, W)
-        coefficient_matrix = coefficients_flat.reshape(polynomial_order + 1, H, W)
-        
-        return coefficient_matrix
+        data_log_flat = data_log.view(N, -1)  # (N, H*W)
+
+        # Vandermonde matrix (N, order+1)
+        X = torch.stack([x_log ** (polynomial_order - i) for i in range(polynomial_order + 1)], dim=1)
+
+        # Solve least-squares: X @ coeffs = data_log_flat
+        coefficients_flat, *_ = torch.linalg.lstsq(X, data_log_flat)
+
+        # Reshape coefficients to (order+1, H, W)
+        coefficient_matrix = coefficients_flat.view(polynomial_order + 1, H, W)
+
+        # Reconstruct fitted signal (still in log-space)
+        reconstructed_log = X @ coefficients_flat  # (N, H*W)
+        reconstructed = torch.exp(reconstructed_log).view(N, H, W)  # (N, H, W)
+
+
+        # Compute R²
+        y_true = data_log_flat
+        y_pred = reconstructed_log
+        ss_res = torch.sum((y_true - y_pred)**2, dim=0)
+        ss_tot = torch.sum((y_true - y_true.mean(dim=0))**2, dim=0)
+        r2_flat = 1 - (ss_res / (ss_tot + 1e-12))
+        r2_map = r2_flat.view(H, W)
+
+        return coefficient_matrix, reconstructed, r2_map
 
 
     def HOS(self,data):
@@ -507,7 +533,7 @@ class thermograms:
         
         return HOS_matrix
     
-    def DMD(self,data, truncation=None):
+    def DMD(self,data, truncation=20):
         """
         Dynamic Mode Decomposition (DMD) for thermographic sequences.
         
@@ -550,7 +576,7 @@ class thermograms:
         return DMD_modes, eig_vals
 
 
-    def DMD_torch(self, data, truncation=None):
+    def DMD_torch(self, data, truncation=20):
         """
         Dynamic Mode Decomposition (DMD) for thermographic sequences (PyTorch version).
         
@@ -678,49 +704,55 @@ class thermograms:
         
         return binary_mask
     
-    def WaveFil(self, data, wavelet='sym5', level=None, mode='soft'):
+    def svd_denoise_2d(self,image, rank=10):
         """
-        Wavelet denoising for 3D thermography sequences (N_frames, H, W)
+        Denoise a 2D image via low-rank SVD approximation.
         
         Args:
-            data: 3D numpy array (N, H, W)
-            wavelet: Wavelet type ('sym5', 'db4', etc.)
-            level: Decomposition level (auto-detected if None)
-            mode: Thresholding mode ('soft', 'hard')
-            
+            image (torch.Tensor): Input 2D image (H, W).
+            rank (int): Rank for truncation. Must be <= min(H, W).
+        
         Returns:
-            Denoised 3D array with same shape as input
+            denoised_image (torch.Tensor): Rank-'rank' approximation of input.
+            S (torch.Tensor): Singular values (for analysis).
         """
-        # Validate input
-        if data.ndim != 3:
-            raise ValueError("Input must be 3D (N_frames, H, W)")
-            
-        # Auto-detect decomposition level
-        if level is None:
-            level = int(np.log2(data.shape[0])) - 3
-            
-        # Process each spatial position independently
-        denoised = np.empty_like(data)
-        for i in range(data.shape[1]):  # Height
-            for j in range(data.shape[2]):  # Width
-                signal = data[:, i, j]
-                
-                # Wavelet decomposition
-                coeffs = pywt.wavedec(signal, wavelet, level=level)
-                
-                # Noise estimation (MAD of detail coefficients)
-                sigma = mad(coeffs[-1])
-                
-                # Universal threshold
-                threshold = sigma * np.sqrt(2 * np.log(len(signal)))
-                
-                # Thresholding
-                coeffs[1:] = [pywt.threshold(c, threshold, mode=mode) for c in coeffs[1:]]
-                
-                # Reconstruction
-                denoised[:, i, j] = pywt.waverec(coeffs, wavelet)
-                
-        return denoised
+        assert rank <= min(image.shape), f"Rank must be <= {min(image.shape)}"
+        
+        # Compute SVD
+        U, S, Vh = torch.linalg.svd(image, full_matrices=False)
+        
+        # Truncate to rank-k
+        Uk, Sk, Vhk = U[:, :rank], S[:rank], Vh[:rank, :]
+        
+        # Reconstruct denoised image
+        denoised_image = Uk @ torch.diag(Sk) @ Vhk
+        
+        return denoised_image, S
+    
+    def svd_denoise(self,video_frames, rank=10):
+        """
+        Denoise a 3D Tensor via low-rank SVD approximation.
+        
+        Args:
+            video_frames (torch.Tensor): Input 3D tensor (T, H, W).
+            rank (int): Rank for truncation. Must be <= min(H, W).
+        
+        Returns:
+            denoised_tensor (torch.Tensor): Rank-'rank' approximation of input.
+            S (torch.Tensor): Singular values (for analysis).
+        """
+        
+        T, H, W = video_frames.shape
+        X = video_frames.view(T, -1)
+        
+        U, S, Vh = torch.linalg.svd(X, full_matrices=False)
+        
+        rank = min(rank, S.shape[0])
+        Uk, Sk, Vhk = U[:, :rank], S[:rank], Vh[:rank, :]
+        
+        X_denoised = (Uk * Sk) @ Vhk
+
+        return X_denoised.view(T, H, W),S
     
     def MeanFil(self, data, window_size=5, axis=0):
         """
@@ -753,3 +785,93 @@ class thermograms:
         )
         
         return np.mean(windows, axis=-1)
+    
+    def robust_normalize_global(self,data):
+        """
+        Normalization of global thermogram sequence.
+        
+        Args:
+            data: Input array (N_frames, H, W)
+            
+        Returns:
+            Normalized array with same shape as input
+        """
+
+        max=data.max()
+        min=data.min()
+
+        return (data-min)/(max-min+1e-8) #To avoid division by zero
+    
+    def robust_standardize_global(self,data):
+        """
+        Standardization of global thermogram sequence.
+        
+        Args:
+            data: Input array (N_frames, H, W)
+            
+        Returns:
+            Standardized array with same shape as input
+        """
+        mean = data.mean()
+        std = data.std()
+        
+        return (data - mean) / (std+1e-8) #To avoid division by zero
+    
+
+    def dmd_background_removal(video_frames, rank=10, device='cpu'):
+        """
+        Args:
+            video_frames (torch.Tensor): Complex tensor of shape (T, H, W) or (T, C, H, W)
+            rank (int): Rank for low-rank approximation
+            device (str): 'cuda' or 'cpu'
+        Returns:
+            background (torch.Tensor): Background video (T, H, W)
+            foreground (torch.Tensor): Foreground video (T, H, W)
+        """
+        # Convert to grayscale if RGB and ensure complex dtype
+        if video_frames.dim() == 4:
+            video_frames = video_frames.mean(dim=1)  # Convert RGB to grayscale
+        if not video_frames.is_complex():
+            video_frames = video_frames.to(torch.complex64)
+        video_frames = video_frames.to(device)
+        
+        T, H, W = video_frames.shape
+        X = video_frames.view(T, -1).T  # Reshape to (H*W, T)
+
+        # Split into time-shifted matrices
+        X1 = X[:, :-1]
+        X2 = X[:, 1:]
+
+        # Step 1: SVD with complex support
+        U, S, Vh = torch.linalg.svd(X1, full_matrices=False)
+        U, S, Vh = U[:, :rank], S[:rank], Vh[:rank, :]  # Truncate to rank
+        
+        # Step 2: Low-rank dynamics matrix (ensure complex operations)
+        Sinv = torch.diag(1.0 / S).to(torch.complex64)
+        A_tilde = U.T.conj() @ X2 @ Vh.T.conj() @ Sinv  # Proper complex matrix mult
+        
+        # Step 3: Eigendecomposition
+        eigvals, eigvecs = torch.linalg.eig(A_tilde)
+        
+        # Step 4: DMD modes
+        Phi = X2 @ Vh.T.conj() @ Sinv @ eigvecs
+        
+        # Step 5: Select background modes (|λ| ≈ 1)
+        bg_mask = torch.abs(eigvals - 1.0) < 0.05
+        Phi_bg = Phi[:, bg_mask]
+        eigvals_bg = eigvals[bg_mask]
+        
+        # Step 6: Reconstruct background (complex-aware)
+        b = torch.linalg.lstsq(Phi_bg, X1[:, 0]).solution
+        Vandermonde = torch.vander(eigvals_bg, T-1, increasing=True).to(torch.complex64)
+        X_bg = Phi_bg @ (b.unsqueeze(1) * Vandermonde)
+        
+        # Reshape and pad
+        background = torch.zeros_like(X, dtype=torch.complex64)
+        background[:, :-1] = X_bg
+        background = background.T.view(T, H, W)
+        
+        # Foreground (complex subtraction)
+        foreground = video_frames - background
+        
+        return background.real, foreground.real  # Return real parts if needed
