@@ -334,7 +334,7 @@ class thermograms:
         T, H, W = data.shape
 
         # Flatten to (T, H*W): samples x features
-        data_flat = data.view(T, -1)  # shape (T, H*W)
+        data_flat = data.reshape(T, -1)  # shape (T, H*W)
 
         # Subtract mean from each column (feature-wise centering)
         mean = data_flat.mean(dim=0, keepdim=True)
@@ -349,7 +349,7 @@ class thermograms:
                 U, s, Vh = torch.linalg.svd(data_centered, full_matrices=False)
 
         # Vh has shape (T, H*W) → spatial EOFs are rows of Vh
-        EOFs = Vh[:n_components].view(n_components, H, W)
+        EOFs = Vh[:n_components].reshape(n_components, H, W)
 
         return EOFs, s[:n_components]
         
