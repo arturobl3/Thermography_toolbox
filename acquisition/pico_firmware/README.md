@@ -1,236 +1,75 @@
-# Raspberry Pi Pico Controller for WIC Thermal Camera System
+# Pico relay firmware
 
-This directory contains the MicroPython firmware for the Raspberry Pi Pico that controls the dual filter wheel system and thermography relay for the WIC thermal camera.
+MicroPython firmware for the Raspberry Pi Pico that switches the halogen-lamp relay during a thermography recording. The host program `acquisition/camera/thermography.cpp` sends it one command over USB serial when heating should start.
 
-## Overview
+The Pico used to drive a dual filter-wheel system as well. That hardware is gone, and the firmware is now relay-only. The old code is in git history: commit `2df92c9`.
 
-The Pico acts as a hardware controller that receives commands via serial communication (UART/USB) and performs two main functions:
+## Wiring
 
-1. **Hyperspectral Imaging**: Controls two stepper motors with absolute position encoders (AS5600) to position dual filter wheels for spectral filtering
-2. **Thermography Mode**: Controls a relay to trigger external heating elements for thermal imaging sequences
+| Pico pin | Connected to |
+|---|---|
+| GPIO15 | Relay input (lamps on when high) |
 
-## Project Structure
+## Serial protocol
+
+The Pico reads one line per command from USB serial (115200 baud) and replies on the same port.
 
 ```
-pico_code/
-├── main.py                      # Main MicroPython firmware
-├── README.md                    # This file
-├── pyproject.toml              # Python project configuration
-├── uv.lock                     # UV package manager lock file
-└── pico_code.code-workspace    # VS Code workspace configuration
+ping <frame_index> <duration_sec> <duration_sec>
 ```
 
-## Hardware Components
+- Turns the relay on for `duration_sec` seconds, turns it off, then replies `pong`.
+- `frame_index` is only logged.
+- `duration_sec` appears twice because `thermography.cpp` sends it twice; only the first value is used.
+- Durations must be between 1 and `MAX_HEATING_SEC` (300 s by default, set in `main.py`).
+- A malformed or out-of-range command gets the reply `error`, and the relay is left off.
+- Lines that don't start with `ping` are ignored.
 
-### Filter Wheel System (Hyperspectral Mode)
-- **2x Stepper Motors**: Control rotation of top and bottom filter wheels
-  - Top motor: DIR=GPIO2, STEP=GPIO3, MS pins=GPIO6/7/8
-  - Bottom motor: DIR=GPIO4, STEP=GPIO5, MS pins=GPIO10/11/12
-  - Microstep resolution: 1/2 step (MS1=1, MS2=0, MS3=0)
-- **2x AS5600 Magnetic Encoders**: Absolute position feedback
-  - Top encoder: I2C0 (SCL=GPIO21, SDA=GPIO20)
-  - Bottom encoder: I2C1 (SCL=GPIO27, SDA=GPIO26)
-- **8 filter positions per wheel**: Each wheel has 8 slots at specific angles
+Example session:
 
-### Relay Control (Thermography Mode)
-- **Relay**: GPIO15 - Controls external heating elements
-
-## Filter Wheel Positions
-
-The filter positions are hard-coded in `main.py` as angular positions in degrees (0-360°):
-
-```python
-top_angles = [344.88, 19.78, 55.68, 91.58, 127.58, 163.92, 198.98, 235.02]
-bottom_angles = [107.18, 143.48, 178.48, 215.24, 254.79, 292.15, 327.25, 2.3]
+```
+> ping 100 5 5
+[INFO] Heating at frame 100 for 5s
+pong          (after 5 s)
 ```
 
-**Note**: There is a +10° offset applied to bottom angles for alignment:
-```python
-target_bottom = bottom_angles[j] + 10  # small offset to align filters properly
-```
+The reply only comes **after** heating has finished, so the host must wait at least `duration_sec` seconds before giving up.
 
-### Adjusting Filter Positions
+## Serial port
 
-If an encoder malfunctions or positions drift, you can correct them by:
-
-1. **Individual position correction**: Edit specific values in the `top_angles` or `bottom_angles` arrays
-2. **Global offset**: Add/subtract a constant offset to all positions in one array
-3. **Alignment offset**: Modify the `+10` offset applied to `target_bottom` in the `move_filter_wheels_to()` function
-
-## Communication Protocol
-
-The Pico listens for commands on stdin (USB serial) and responds with acknowledgments.
-
-### Hyperspectral Mode Command
-```
-ping i_j\n
-```
-- `i`: Top wheel filter index (0-7)
-- `j`: Bottom wheel filter index (0-7)
-- **Response**: `pong` when both wheels reach their target positions
-- **Error Response**: `error` if indices are out of range or parsing fails
-
-**Example**:
-```
-ping 3_5
-[INFO] Hyperspectral ping received: i=3, j=5
-pong
-```
-
-### Thermography Mode Command
-```
-ping <frame_index> <duration_sec> <duration_sec>\n
-```
-- `frame_index`: Frame number (for logging)
-- `duration_sec`: How long to activate the relay (in seconds)
-- **Response**: `pong` after relay turns off
-- **Error Response**: `error` if parsing fails
-
-**Example**:
-```
-ping 42 5 5
-[INFO] Thermography ping received: frame 42, duration 5s
-pong
-```
-
-## Motor Control Algorithm
-
-The stepper motors use closed-loop position control with encoder feedback:
-
-1. Read current angle from AS5600 encoder
-2. Calculate shortest angular distance to target (accounting for 0°/360° wraparound)
-3. Move one microstep in the appropriate direction
-4. Repeat until position is within 0.5° tolerance
-5. Maximum 2000 attempts as safety stop
-
-**Parameters**:
-- Step delay: 2ms between steps
-- Position tolerance: 0.5°
-- Maximum attempts: 2000 steps
-- Settling time: 0.5s after each motor movement
-
-## How to Upload Changes to the Pico
-
-After modifying `main.py`, you need to upload the updated firmware to the Pico. Here are four methods:
-
-Address the board by its by-id symlink (`/dev/ttyACM*` numbering follows enumeration order, and the ODrive motor controller takes `ttyACM0`, pushing the Pico to `ttyACM1`). The same path is the default in `main_operation/picoserial.h`, overridable with `PICO_SERIAL_PORT`.
-
-### Method 1: Using `mpremote` (Recommended)
-
-Best for command-line workflows and automation.
+Address the board by its stable by-id path. The `/dev/ttyACM*` number depends on enumeration order: when the ODrive controller is connected it takes `ttyACM0`, and the Pico ends up on `ttyACM1`.
 
 ```bash
-# Install mpremote (first time only)
-pip install mpremote
-
-# Upload the updated main.py
 PICO_PORT=/dev/serial/by-id/usb-MicroPython_Board_in_FS_mode_e6614104034a962a-if00
-mpremote connect "$PICO_PORT" fs cp main.py :main.py
-
-# Reset the Pico to run the new code
-mpremote connect "$PICO_PORT" reset
 ```
 
-### Method 2: Using `ampy`
+The same path is the default in `acquisition/camera/picoserial.h`. Set the `PICO_SERIAL_PORT` environment variable to override it.
 
-Alternative command-line tool from Adafruit.
+Opening the port normally raises DTR, and MicroPython reacts to that with a soft reset. `picoserial.h` avoids this by keeping DTR and RTS low. Keep that in mind if you write another host program.
+
+## Uploading the firmware
+
+`mpremote` is the only dependency in this folder's `pyproject.toml`:
 
 ```bash
-# Install ampy (first time only)
-pip install adafruit-ampy
-
-# Upload the file
-ampy --port "$PICO_PORT" put main.py
-
-# Manually reset the Pico (unplug/replug or press reset button)
+cd acquisition/pico_firmware
+uv sync
+uv run mpremote connect "$PICO_PORT" fs cp main.py :main.py
+uv run mpremote connect "$PICO_PORT" reset
 ```
 
-### Method 3: Using Thonny IDE (GUI)
+To try the firmware by hand, open a REPL with `uv run mpremote connect "$PICO_PORT"` and type a command such as `ping 0 2 2`. The relay should click on for 2 s, then you should see `pong`. Exit with `Ctrl-]`.
 
-Good for beginners or interactive development.
+Other ways to upload work too:
+- **Thonny:** select the "MicroPython (Raspberry Pi Pico)" interpreter, then *Save as → Raspberry Pi Pico → `main.py`*.
+- **USB mass storage:** hold BOOTSEL while plugging in the board. Note that this route needs the MicroPython UF2 to be installed first.
 
-1. Install Thonny: `sudo apt install thonny`
-2. Open Thonny
-3. Go to **Tools → Options → Interpreter**
-4. Select "MicroPython (Raspberry Pi Pico)"
-5. Select the port `/dev/serial/by-id/usb-MicroPython_Board_in_FS_mode_e6614104034a962a-if00`
-6. Open your `main.py` in Thonny
-7. Click **File → Save as...** and choose "Raspberry Pi Pico"
-8. Save as `main.py`
-
-### Method 4: Manual Copy via USB Mass Storage
-
-No additional software needed, but requires physical access.
-
-1. **Unplug the Pico from USB**
-2. **Hold the BOOTSEL button** on the Pico while plugging it back into USB
-3. The Pico will appear as a USB mass storage device named "RPI-RP2"
-4. **Drag and drop** your `main.py` file onto the drive
-5. The Pico will automatically reboot and run the new code
-
-**Note**: This method requires the Pico to already have MicroPython installed. If starting fresh, you need to copy the MicroPython UF2 firmware first.
+The VS Code MicroPico extension is configured through `.micropico` and `.vscode/`.
 
 ## Troubleshooting
 
-### Encoder Not Responding
-- Check I2C connections (SCL/SDA wiring)
-- Verify encoder power supply (3.3V)
-- Check encoder I2C address (should be 0x36)
-- Method returns -1 if read fails
-
-### Motor Not Moving
-- Verify stepper driver power supply
-- Check DIR and STEP pin connections
-- Ensure MS1/MS2/MS3 pins are correctly set
-- Verify motor wiring (coil A and coil B)
-
-### Position Drift
-- Encoders may need recalibration
-- Edit `top_angles` or `bottom_angles` arrays in `main.py`
-- Adjust the +10° offset for bottom wheel alignment if needed
-
-### Serial Communication Issues
-- Check USB connection (`ls /dev/ttyACM*`)
-- Ensure no other program is using the serial port
-- Verify baud rate matches (default is 115200 for Pico USB)
-- Check for proper line endings (`\n`)
-
-### Filter Wheels Not Reaching Position
-- Increase `max_attempts` in `move_to_angle_with_encoder()` if motors are moving slowly
-- Adjust `tolerance` if precision requirements are different
-- Check for mechanical obstructions in filter wheel rotation
-- Verify encoder magnet alignment and distance from sensor
-
-## Calibration Procedure
-
-On startup, the Pico automatically moves both filter wheels to position (0,0):
-
-```python
-time.sleep(0.5)
-move_filter_wheels_to(0,0)  # Calibration to home position
-time.sleep(0.5)
-```
-
-This ensures a known starting position before accepting commands.
-
-## Integration with Main System
-
-The C++ programs in the `main_operation` folder communicate with this Pico firmware:
-
-- **hyperspectral.cpp**: Sends `ping i_j` commands to position filter wheels for each spectral band combination
-- **thermography.cpp**: Sends thermography relay commands for thermal imaging sequences
-
-The Pico waits for `pong` responses before proceeding to the next frame capture.
-
-## Dependencies
-
-The code uses MicroPython's built-in libraries:
-- `machine`: Hardware control (Pin, I2C)
-- `time`: Delays and timing
-- `sys`: stdin for serial communication
-
-No external MicroPython libraries are required.
-
-## License
-
-Part of the WIC Thermal Camera system.
+- **No `pong`, or a timeout on the host:**
+  - Check that nothing else holds the port open: a stray `mpremote`, a Thonny session, or a second host program.
+  - Check that `main.py` was actually uploaded and the board was reset after the upload.
+- **`error` reply:** the duration is out of range, or the command doesn't have exactly four fields.
+- **Relay doesn't click:** check the relay's supply and the GPIO15 wiring. Test it from the REPL with `from machine import Pin; Pin(15, Pin.OUT).on()`.
