@@ -1,6 +1,6 @@
 #pragma once
 
-// USB-CDC link to the Pico that runs the relay / filter-wheel firmware (pico_code/main.py).
+// USB-CDC link to the Pico that runs the lamp-relay firmware (acquisition/pico_firmware/main.py).
 
 #include <sys/ioctl.h>
 #include <fcntl.h>
@@ -33,8 +33,8 @@ public:
     ~PicoLink() { close(); }
 
     // Opening a CDC-ACM port in the usual way raises DTR, and MicroPython answers a
-    // rising DTR with a soft reset: main.py restarts, the filter wheels re-home for
-    // seconds, and a command written right after open is swallowed by the REPL
+    // rising DTR with a soft reset: main.py restarts, and a command written right
+    // after open is swallowed by the REPL
     // boot window instead of reaching main.py's command loop. Keep DTR and RTS low
     // across open, and leave HUPCL cleared so closing does not toggle them either.
     bool open() {
@@ -81,9 +81,9 @@ public:
     }
 
     // Sends one command line and waits for "pong". The firmware prints an
-    // [INFO]/[ERROR] line first, then performs the action (relay on for the heating
-    // duration, filter wheels turning), then replies - so the timeout has to cover
-    // the action, not just the wire.
+    // [INFO] line first, then performs the action (relay on for the heating
+    // duration), then replies - so the timeout has to cover the action, not just
+    // the wire.
     bool sendCommand(const std::string& command, std::chrono::milliseconds timeout) {
         if (fd < 0) return false;
 

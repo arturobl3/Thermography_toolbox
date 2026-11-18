@@ -10,8 +10,6 @@ Code that runs the physical thermography setup and records the sequences that `p
 | `pico_firmware/` | MicroPython firmware for the Pico; [its README](pico_firmware/README.md) covers the protocol, wiring and how to upload |
 | `../vendor/wic_sdk/` | WIC SDK 3.1: installer zip, API documentation, examples, manuals, license and calibration files |
 
-`camera/hyperspectral.cpp` drove the old filter-wheel setup. It no longer works with the relay-only firmware.
-
 ## 1. Install the WIC SDK (once per machine)
 
 ```bash
@@ -22,7 +20,13 @@ sudo apt install /tmp/wic_sdk/eBUS_Runtime_Ubuntu-22.04-x86_64-6.4.0-6670.deb
 sudo apt install /tmp/wic_sdk/wic-sdk_3.1_amd64.deb
 ```
 
-The camera programs also need OpenCV: `sudo apt install libopencv-dev`.
+The eBUS runtime needs its environment set in every shell that runs the camera programs. Without it they exit with `GENICAM_ROOT_V3_3 is not set`. Add this line to `~/.zshrc` or `~/.bashrc`:
+
+```bash
+source /opt/pleora/ebus_sdk/Ubuntu-22.04-x86_64/bin/set_puregev_env.sh
+```
+
+`preview` also needs OpenCV (`sudo apt install libopencv-dev`). Without it, CMake skips `preview` and builds `thermography` only.
 
 The API reference is at `vendor/wic_sdk/documentation/index.html`.
 
