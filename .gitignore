@@ -24,6 +24,9 @@ models/
 results/
 logs/
 
+# C++ build output (CMake)
+build/
+
 # IDE files
 .vscode/
 .idea/
