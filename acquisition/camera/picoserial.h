@@ -80,41 +80,41 @@ public:
         fd = -1;
     }
 
-    // Sends one command line and waits for "pong". The firmware prints an
-    // [INFO] line first, then performs the action (relay on for the heating
-    // duration), then replies - so the timeout has to cover the action, not just
-    // the wire.
-    bool sendCommand(const std::string& command, std::chrono::milliseconds timeout) {
-        if (fd < 0) return false;
+    // The firmware prints an [INFO] line, performs the action (relay on for the
+    // heating duration), and only then replies "pong" (or "error" if it rejected
+    // the command). send() + poll() let the caller keep working - e.g. grabbing
+    // frames - while that happens, instead of blocking until the reply.
+    enum class Reply { Pending, Pong, Error };
 
+    // Writes one command line without waiting for the reply.
+    bool send(const std::string& command) {
+        if (fd < 0) return false;
+        received_.clear();
         const std::string line = command + "\n";
         if (::write(fd, line.data(), line.size()) < 0) {
-            std::cerr << "[ERROR] Write to serial failed\n";
+            std::cerr << "[ERROR] Write to serial failed: " << std::strerror(errno) << "\n";
             return false;
         }
-
-        const auto start = std::chrono::steady_clock::now();
-        std::string response;
-        char buf[256];
-        while (true) {
-            const ssize_t n = ::read(fd, buf, sizeof(buf));
-            if (n > 0) {
-                response.append(buf, static_cast<size_t>(n));
-                if (response.find("pong") != std::string::npos) {
-                    std::cout << "[INFO] Pico confirmed: " << command << "\n";
-                    return true;
-                }
-                if (response.find("error") != std::string::npos) {
-                    std::cerr << "[ERROR] Pico rejected \"" << command << "\": " << response << "\n";
-                    return false;
-                }
-            }
-            if (std::chrono::steady_clock::now() - start > timeout) {
-                std::cerr << "[ERROR] Timeout waiting for pong after \"" << command << "\". Got: "
-                          << response << "\n";
-                return false;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
+        return true;
     }
+
+    // Collects whatever has arrived since send() and reports whether the reply is
+    // complete. Never blocks: the port is opened with VMIN = VTIME = 0.
+    Reply poll() {
+        if (fd < 0) return Reply::Error;
+        char buf[256];
+        ssize_t n;
+        while ((n = ::read(fd, buf, sizeof(buf))) > 0) {
+            received_.append(buf, static_cast<size_t>(n));
+        }
+        if (received_.find("pong") != std::string::npos) return Reply::Pong;
+        if (received_.find("error") != std::string::npos) return Reply::Error;
+        return Reply::Pending;
+    }
+
+    // Everything the Pico sent since the last send(), for error messages.
+    const std::string& received() const { return received_; }
+
+private:
+    std::string received_;
 };

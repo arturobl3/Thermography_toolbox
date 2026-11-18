@@ -46,30 +46,50 @@ See [pico_firmware/README.md](pico_firmware/README.md#uploading-the-firmware).
 
 ```bash
 ./build/preview            # optional: live view to check framing and focus ('high' for the high thermal range)
-./build/thermography <frame_count> <session_name> <heating_start_frame> <heating_duration_sec>
-# e.g. 3000 frames, lamps on at frame 100 for 5 s:
+./build/thermography <frame_count> <session_name> <heating_start_frame> <heating_duration_sec> [options]
+# e.g. 3000 frames, lamps on after frame 100 for 5 s:
 ./build/thermography 3000 d1_cooldown 100 5
 ```
 
-Frames are written to `~/Desktop/data/<session_name>/`, one file per frame:
+| Option | Default | |
+|---|---|---|
+| `--license <file>` | `vendor/wic_sdk/license 332C2309.wlic` | Needed for calibration; the program refuses to run without it |
+| `--data-dir <dir>` | `data/` in the repo root | Where session folders are created. `data/` is gitignored |
+| `--range low\|high` | `low` (−25…120 °C) | Set once per session; never switch range mid-session |
+| `--nuc manual\|auto` | `manual` | `manual`: one flat-field correction (shutter closed ~5 s) before recording, shutter open throughout. `auto`: the camera may close the shutter mid-recording |
 
-| Subfolder | Content | dtype |
+`heating_duration_sec = 0` records without heating. A session name that already exists is refused, so nothing gets overwritten.
+
+The camera keeps recording while the lamps are on: the program sends the heating command and checks for the Pico's reply on every frame instead of waiting for it.
+
+### Output
+
+Everything goes to `data/<session_name>/` in the repo root, or to `<data-dir>/<session_name>/` if you pass `--data-dir`. The default is compiled in, so it's the same no matter which folder you run the program from:
+
+| File | Content | dtype |
 |---|---|---|
 | `raw/<n>.bin` | Raw sensor counts | `uint16` |
-| `calibrated/<n>.bin` | Counts after the camera's calibration | `uint16` |
+| `calibrated/<n>.bin` | Counts after the license calibration (sensor temperature refreshed every 15 frames) | `uint16` |
 | `temperature/<n>.bin` | Temperature in °C | `float32` |
+| `frames.csv` | `frame, time_s, sensor_temp_c, lamp_on`: one row per frame. `time_s` is when the frame arrived; `lamp_on` is accurate to about one frame | text |
+| `session.txt` | Command, camera settings (range, lens, NUC mode, FFC reference temperature), measured fps and heating result | text |
 
-Load them with the toolbox:
+Even with the license, the camera's calibration is off by several °C at the low end of the range (see `thermal_bandpass/Docs/camera_control.md`). Changes in temperature over time are reliable; absolute values are not.
+
+**Sessions recorded with the old `thermography`**, the ones without `frames.csv` and `session.txt`, were made without the license: their `calibrated/` frames are identical to `raw/`, and `temperature/` was computed from uncalibrated counts. They also miss the heating phase, because capture paused while the lamps were on.
+
+Load a session with the toolbox:
 
 ```python
 from pathlib import Path
 import numpy as np
+import pandas as pd
 from pulse_method.toolbox_pulse import thermograms
 
-session = Path.home() / "Desktop" / "data" / "d1_cooldown"   # loadfrombinfiles does not expand "~"
+session = Path("data/d1_cooldown").resolve()   # run from the repo root; loadfrombinfiles does not expand "~"
 analyzer = thermograms(height=512, width=640)
 data = analyzer.loadfrombinfiles(str(session / "calibrated"))                     # uint16
 temp = analyzer.loadfrombinfiles(str(session / "temperature"), dtype=np.float32)
+frames = pd.read_csv(session / "frames.csv")       # real time axis and heating window
+heating = frames[frames.lamp_on == 1].frame         # frames recorded while the lamps were on
 ```
-
-**Known issue:** `thermography` stops capturing while the lamps are on. It waits for the Pico's `pong`, which only arrives after heating ends. So each recording is missing the heating phase, and the frames after it are offset in time by `heating_duration_sec`.

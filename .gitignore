@@ -13,6 +13,9 @@ ENV/
 __pycache__/
 *.py[cod]
 
+# Recorded sessions (acquisition/camera/thermography writes here)
+/data/
+
 # Data files
 *.bin
 *.npy
