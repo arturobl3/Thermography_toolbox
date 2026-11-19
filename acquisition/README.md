@@ -42,10 +42,29 @@ cmake --build build
 
 See [pico_firmware/README.md](pico_firmware/README.md#uploading-the-firmware).
 
-## 4. Record a session
+## 4. Frame and focus with `preview`
 
 ```bash
-./build/preview            # optional: live view to check framing and focus ('high' for the high thermal range)
+./build/preview             # options: --range low|high (default low), --license <file>
+```
+
+`preview` sets the camera up the same way as `thermography`: license calibration, range, lens, manual NUC and one flat-field correction at startup (the shutter closes for about 5 s). The image is scaled to the temperature span of the scene, ignoring the hottest and coldest 0.5 % of pixels.
+
+To focus, turn the lens until the edges of the sample light up in green (**focus peaking**) and the **sharpness** number at the top is at its maximum. The number turns green when it is within 2 % of the best value seen so far.
+
+| Control | |
+|---|---|
+| `peaking %` slider | Threshold: a pixel is painted green when its temperature gradient exceeds this percentage of the displayed span per pixel. Lower it for low-contrast samples |
+| `p` | Focus peaking on/off |
+| `r` | Reset the best sharpness (do this after moving the camera or sample) |
+| `q` / Esc | Quit |
+| mouse | Shows the temperature under the cursor |
+
+Sharpness is the RMS temperature gradient of the whole frame in mK/px. Compare it only within one scene: it depends on the sample's contrast, not only on focus.
+
+## 5. Record a session
+
+```bash
 ./build/thermography <frame_count> <session_name> <heating_start_frame> <heating_duration_sec> [options]
 # e.g. 3000 frames, lamps on after frame 100 for 5 s:
 ./build/thermography 3000 d1_cooldown 100 5

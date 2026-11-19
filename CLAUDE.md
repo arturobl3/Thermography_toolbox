@@ -9,7 +9,8 @@ The goal is a single repo for the lab's pulse-thermography work. It is a fork (`
 - **`pulse_method/`**: Konrad's analysis code. A single `thermograms` class in `toolbox_pulse.py` loads a sequence of shape `(N_frames, H, W)` and runs PPT, PCT, TSR, HOS and DMD. Each has a NumPy version and a `*_torch` version; the torch versions accept NumPy input and return tensors. It also has filtering helpers (`SavGol`, `MeanFil`, `svd_denoise`, `binarize_mask`). It is installed with `pip install .` (`setup.py`, package name `thermography_toolbox`). **Leave this folder as Konrad wrote it**, so his updates merge cleanly once his repo is added as `upstream` (not done yet).
 - **`acquisition/`**: our hardware code, which records the sequences `pulse_method` analyses. See `acquisition/README.md` for the full setup and recording guide.
   - `camera/thermography.cpp`: records N frames from the Workswell WIC camera and switches on the halogen lamps at a given frame through the Pico.
-  - `camera/preview.cpp`: live view (needs OpenCV).
+  - `camera/preview.cpp`: live view for framing and focusing, with focus peaking and a sharpness score (needs OpenCV). Uses the same license, range and NUC setup as `thermography`.
+  - `camera/wicsetup.h`: code shared by both programs (`kLens`, `runFlatField`).
   - `camera/picoserial.h`: the USB serial link to the Pico (`send()` + `poll()`, which never block).
   - `pico_firmware/main.py`: MicroPython relay firmware. Protocol: `ping <frame> <dur> <dur>` → relay on for `dur` s → `pong`; bad commands get `error`; `MAX_HEATING_SEC = 300`.
 - **`vendor/wic_sdk/`**: Workswell WIC SDK 3.1 (installer zip with `.deb`s, Doxygen API docs at `documentation/index.html`, examples, manuals) and the camera license file. Committed on purpose. Don't edit.
@@ -56,7 +57,7 @@ The detailed reference is `Docs/camera_control.md` in `arturobl3/thermal_bandpas
    - Writing three files per frame is about 80 MB/s at 30 fps. If `measured_fps` drops below 30, the disk can't keep up.
 2. Add Konrad's repo as `upstream` and fetch from it. Not done yet.
 3. Merge the U-Net repo (`arturobl3/thermography`: synthetic-data U-Net denoiser/segmenter for defect maps, `helper_functions.py`, real defect maps in `data/real/`) into this one. When that happens, move this repo from `setup.py` to `pyproject.toml` + uv. The `.gitignore` rules `/data/` and `*.npy` would hide the U-Net repo's tracked `data/real/*.npy`, so add an exception or give them another location. Note that this repo has its own CLAUDE.md, and that it currently installs `pulse_method` from Konrad's GitHub, pinned to commit `f2c8900`, not from this fork.
-4. `preview.cpp:265` ignores the return value of `doNUCUpdate()`, and `preview` doesn't use the license either.
+4. The new `preview` (license, manual NUC + startup FFC, focus peaking) has not been run on the camera yet either. Check that the image looks right and that the peaking threshold default (15 %) is useful on a real sample.
 
 The full filter-wheel and hyperspectral code (dual stepper motors, encoders, `hyperspectral.cpp`, debug scripts) was removed because the hardware no longer exists. It's in commit `2df92c9` if it's ever needed.
 

@@ -1,22 +1,44 @@
+// Live view of the WIC camera, calibrated with the license, with focus peaking.
+//
+// Use it to frame and focus the sample before recording with `thermography`.
+// The camera is set up the same way as for a recording (license calibration,
+// range, lens, manual NUC with one flat-field correction at startup), so what
+// you see here is what gets recorded.
+//
+// Focus aids:
+//   - Focus peaking: pixels whose temperature gradient is above the threshold
+//     are painted green. Turn the focus ring until the edges of the sample light
+//     up as thin, dense lines. The "peaking %" slider sets the threshold as a
+//     percentage of the displayed temperature span per pixel.
+//   - Sharpness: RMS temperature gradient of the whole frame in mK/px. It is
+//     highest at best focus; "best" holds the maximum seen so far.
+//
+// Keys: p = peaking on/off, r = reset best sharpness, q / Esc = quit.
+
 #include <wic/calibrationdata.h>
 #include <wic/camerafinder.h>
 #include <wic/framegrabber.h>
 #include <wic/wic.h>
 
+#include "wicsetup.h"
+
 #include <opencv2/highgui.hpp>
-#include <opencv2/opencv.hpp>
+#include <opencv2/imgproc.hpp>
 
 #include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
-
-#include <fcntl.h>
-#include <termios.h>
-#include <unistd.h>
-#include <cstring>
-
+#ifndef WIC_LICENSE_PATH
+#define WIC_LICENSE_PATH ""  // set by CMakeLists.txt
+#endif
 
 // Color mapping structure for the video stream
 struct color {
@@ -112,197 +134,279 @@ static constexpr std::array<color, 256> BWIron1Plt = {
 	  { 255, 245, 166 } }
 };
 
+namespace {
 
-// Pointer to the camera object
-wic::WIC* cam{ nullptr };
-std::pair<int, int> resolution;
+constexpr const char* kWindow = "preview";
+constexpr const char* kPeakingTrackbar = "peaking %";
+constexpr int kDefaultPeakingPercent = 15;
+constexpr int kSensorTempRefreshFrames = 15;  // re-read sensor temperature this often
+constexpr double kDisplayClipFraction = 0.005;  // ignore the coldest/hottest 0.5% when scaling
+constexpr double kMinDisplaySpanC = 0.5;        // never stretch less than this over the palette
+constexpr double kSharpnessSmoothing = 0.2;     // weight of the newest frame in the average
+constexpr double kNearBestFraction = 0.98;      // sharpness shown green when this close to best
 
-cv::Mat mx_color;
+struct Options {
+    std::string licensePath = WIC_LICENSE_PATH;
+    std::string rangeName = "low";
+};
 
-// Vectors for storing raw and temperatures values
-std::vector<uint16_t> bufferRAW;
-std::vector<float> bufferTemp;
-
-
-// Function to print on mouse hover over camera video stream
-void mouseCallback(int event, int x, int y, int flags, void* userData) {
-    // Function for mouse hover interaction with the video stream
-    if (event != cv::EVENT_MOUSEMOVE)
-        return;
-    if ((y * resolution.first + x) >= bufferRAW.size())
-        return;
-    std::cout << "mouse(" << x << "," << y << ") - Raw values: "
-              << bufferRAW.at(y * resolution.first + x) << " Temperature: "
-              << bufferTemp.at(y * resolution.first + x) << std::endl;
+void printUsage(const char* prog) {
+    std::cerr << "Usage: " << prog << " [low|high] [options]\n"
+              << "\n"
+              << "Options:\n"
+              << "  --range low|high   Temperature range, low = -25..120 C (default: low)\n"
+              << "  --license <file>   WIC license (.wlic). Default:\n"
+              << "                     " << WIC_LICENSE_PATH << "\n"
+              << "\n"
+              << "Keys: p = focus peaking on/off, r = reset best sharpness, q / Esc = quit.\n";
 }
 
-// Function to formulate matrix from frame
-template <typename T>
-void matFromFrame(const std::vector<T>& data, cv::Mat& mx) {
-    auto k = 0;
-    for (int i = 0; i < mx.rows; i++) {
-        for (int j = 0; j < mx.cols; j++) {
-            mx.at<T>(i, j) = data[k];
-            k++;
+bool parseArgs(int argc, char* argv[], Options& opt) {
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") return false;
+        if (arg == "low" || arg == "high") {
+            opt.rangeName = arg;
+        } else if (arg == "--range" || arg == "--license") {
+            if (i + 1 >= argc) {
+                std::cerr << "[ERROR] " << arg << " needs a value\n";
+                return false;
+            }
+            const std::string value = argv[++i];
+            if (arg == "--range") opt.rangeName = value;
+            if (arg == "--license") opt.licensePath = value;
+        } else {
+            std::cerr << "[ERROR] Unknown argument " << arg << "\n";
+            return false;
         }
     }
+    if (opt.rangeName != "low" && opt.rangeName != "high") {
+        std::cerr << "[ERROR] --range must be low or high\n";
+        return false;
+    }
+    if (opt.licensePath.empty()) {
+        std::cerr << "[ERROR] No license file: pass --license <file>\n";
+        return false;
+    }
+    return true;
 }
 
-// Function to overlay color mapping over video stream
-void colorMat(const std::vector<float>& data, cv::Mat& mx) {
-    auto minmax = std::minmax_element(std::cbegin(data), std::cend(data));
-    auto min = *minmax.first;
-    auto max = *minmax.second;
-    auto step = (max - min) / 256.f;
+// Last mouse position over the window, for the temperature readout.
+int mouseX = -1;
+int mouseY = -1;
 
-    auto k = 0;
-    for (int i = 0; i < mx.rows; i++) {
-        for (int j = 0; j < mx.cols; j++) {
-            int index = (data[k] - min) / step;
-            index = std::clamp(index, 0, 255);
-            auto color = BWIron1Plt[index];
-
-            mx.at<cv::Vec3b>(i, j)[0] = color.r;
-            mx.at<cv::Vec3b>(i, j)[1] = color.g;
-            mx.at<cv::Vec3b>(i, j)[2] = color.b;
-
-            k++;
-        }
+void onMouse(int event, int x, int y, int, void*) {
+    if (event == cv::EVENT_MOUSEMOVE) {
+        mouseX = x;
+        mouseY = y;
     }
 }
 
-
-
-// Handler of camera raw input which transform and print raw and temperature values while streaming camera feed
-void bufferHandler(std::vector<uint16_t>& data, float temp, int delay) {
-    bufferRAW.resize(data.size());
-    bufferRAW = data;
-
-    cam->calibrateRawInplace(bufferRAW.data(), bufferRAW.size(), temp);
-    auto resolution = cam->getCurrentTemperatureResolution();
-
-    bufferTemp.clear();
-
-    std::transform(std::cbegin(bufferRAW), std::cend(bufferRAW), std::back_inserter(bufferTemp),
-                   [tlin = resolution](uint16_t r) { return wic::rawToCelsius(r, tlin); });
-
-    colorMat(bufferTemp, mx_color);
-
-    cv::imshow("camera", mx_color);
-    cv::waitKey(delay);
+// The palette as an OpenCV lookup table (OpenCV images are BGR).
+cv::Mat paletteLut() {
+    cv::Mat lut(256, 1, CV_8UC3);
+    for (int i = 0; i < 256; ++i) {
+        const color& c = BWIron1Plt[i];
+        lut.at<cv::Vec3b>(i) = cv::Vec3b(c.b, c.g, c.r);
+    }
+    return lut;
 }
 
-// Setting camera range, low range indicate higier resolution, while high range indicate lower resolution
-int setCameraRange(const std::string& range) {
-    if (!cam) {
-        std::cerr << "Camera not initialized properly!" << std::endl;
-        return -1;
-    }
-
-    wic::Range camRange;
-    if (range == "high") {
-        camRange = wic::Range::High;
-    } else if (range == "low") {
-        camRange = wic::Range::Low;
-    } else {
-        std::cerr << "Invalid range specified. Please use 'high' or 'low'." << std::endl;
-        return -1;
-    }
-
-    auto res = cam->setRange(camRange);
-    if (res != wic::ResponseStatus::Ok) {
-        std::cerr << "Failed to set range." << std::endl;
-        return -1;
-    }
-    std::cout << "Thermal range set to: " << range << std::endl;
-    return 0;
+// Temperature span to map onto the palette, ignoring a few outlier pixels so a
+// hot spot elsewhere in the view doesn't flatten the contrast of the sample.
+std::pair<double, double> displayRange(const std::vector<float>& temps,
+                                       std::vector<float>& scratch) {
+    scratch = temps;
+    const size_t lo = static_cast<size_t>(scratch.size() * kDisplayClipFraction);
+    const size_t hi = scratch.size() - 1 - lo;
+    std::nth_element(scratch.begin(), scratch.begin() + lo, scratch.end());
+    const double low = scratch[lo];
+    std::nth_element(scratch.begin() + lo, scratch.begin() + hi, scratch.end());
+    const double high = scratch[hi];
+    if (high - low >= kMinDisplaySpanC) return {low, high};
+    const double mid = (low + high) / 2.0;
+    return {mid - kMinDisplaySpanC / 2.0, mid + kMinDisplaySpanC / 2.0};
 }
+
+std::string fixed(double value, int decimals) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(decimals) << value;
+    return out.str();
+}
+
+// Text with a dark outline, readable on any part of the palette.
+void drawText(cv::Mat& img, const std::string& text, int line,
+              const cv::Scalar& colorBgr = cv::Scalar(255, 255, 255)) {
+    const cv::Point org(8, 20 + 20 * line);
+    cv::putText(img, text, org, cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 3,
+                cv::LINE_AA);
+    cv::putText(img, text, org, cv::FONT_HERSHEY_SIMPLEX, 0.5, colorBgr, 1, cv::LINE_AA);
+}
+
+}  // namespace
 
 int main(int argc, char* argv[]) {
-    // Default to low thermal range unless user explicitly requests high
-    std::string rangeInput = "low";
-    
-    // Check command line arguments for thermal range
-    if (argc > 1) {
-        std::string arg = argv[1];
-        if (arg == "high" || arg == "--high" || arg == "-h") {
-            rangeInput = "high";
-        } else if (arg == "low" || arg == "--low" || arg == "-l") {
-            rangeInput = "low";
-        } else if (arg == "--help") {
-            std::cout << "Usage: " << argv[0] << " [thermal_range]" << std::endl;
-            std::cout << "  thermal_range: 'high' or 'low' (default: low)" << std::endl;
-            std::cout << "  Options:" << std::endl;
-            std::cout << "    high, --high, -h  : Use high thermal range (lower resolution)" << std::endl;
-            std::cout << "    low, --low, -l    : Use low thermal range (higher resolution, default)" << std::endl;
-            return 0;
-        } else {
-            std::cerr << "Invalid argument: " << arg << std::endl;
-            std::cout << "Use --help for usage information" << std::endl;
-            return 1;
-        }
-    }
-
-    // Connecting to the camera through its serial number, do not require license file
-    auto serialNumber = "332C2309";
-    cam = wic::findAndConnect(serialNumber);
-
-     if (!cam) {
-        std::cerr << "Camera connection failed!" << std::endl;
+    Options opt;
+    if (!parseArgs(argc, argv, opt)) {
+        printUsage(argv[0]);
         return 1;
     }
-    if (!cam->connected()) {
-        std::cerr << "Camera not connected!" << std::endl;
+
+    // --- Connect with the license, so calibrateRawInplace actually calibrates ---
+    wic::LicenseFile license(opt.licensePath.c_str());
+    if (!license.isOk()) {
+        std::cerr << "[ERROR] Could not load license file " << opt.licensePath << "\n";
         return 2;
     }
-
-    // Camera defoult settings initialization
-    auto wicDefaultRes = cam->doDefaultWICSettings();
-    std::cout << "doDefaultWIC settings: "
-              << wic::responseStatusToStr(wicDefaultRes.status) <<std::endl;
-
-    // NUC update of the camera
-    cam->doNUCUpdate();
-    std::cout << "Frame rate of the camera: ";
-    std::cout << cam->getSpeed() << std::endl;  // Depicts speed of the camera
-
-    // Set camera thermal range (defaulting to low unless specified)
-    std::cout << "Using thermal range: " << rangeInput << std::endl;
-
-    // Ensure the range setting is valid
-    if (setCameraRange(rangeInput) != 0) {
-        return 1;
+    wic::WIC* cam = wic::findAndConnect(license);
+    if (!cam || !cam->connected()) {
+        std::cerr << "[ERROR] Could not connect to WIC " << license.serialNumber() << ".\n";
+        return 2;
     }
-    
-    std::cout << "Range: " << static_cast<int>(cam->getRange()) << std::endl;  // Display camera range
+    std::cout << "[INFO] Connected to WIC " << license.serialNumber() << "\n";
 
-    // Set camera resolution and display window
-    resolution = std::make_pair(cam->getResolution().result[0], cam->getResolution().result[1]);
-    mx_color = cv::Mat(resolution.second, resolution.first, CV_8UC3);
+    if (cam->doDefaultWICSettings().status != wic::ResponseStatus::Ok) {
+        std::cerr << "[ERROR] Failed to apply default settings.\n";
+        return 4;
+    }
 
-    cv::namedWindow("camera");
-    cv::setMouseCallback("camera", mouseCallback, nullptr);
+    const wic::Range range = (opt.rangeName == "high") ? wic::Range::High : wic::Range::Low;
+    auto rangeRes = cam->setRangeAndLens(range, kLens);
+    if (!rangeRes.isOk()) {
+        std::cerr << "[ERROR] Failed to set range " << opt.rangeName << " / lens " << kLens << ": "
+                  << wic::responseStatusToStr(rangeRes.status) << "\n";
+        return 4;
+    }
+    if (rangeRes.result > 0) {
+        std::cerr << "[WARN] " << rangeRes.result
+                  << " errors in the camera's correction data; check frames for artifacts\n";
+    }
+    const auto tempRes = cam->getCurrentTemperatureResolution();  // must follow setRangeAndLens
+    std::cout << "[INFO] Range " << opt.rangeName << ", lens " << kLens << "\n";
 
-    // Frame grabber setup
+    auto resolution = cam->getResolution();
+    const int width = resolution.result[0];
+    const int height = resolution.result[1];
+    if (!resolution.isOk() || width <= 0 || height <= 0) {
+        std::cerr << "[ERROR] Invalid resolution.\n";
+        return 3;
+    }
+
+    // --- NUC: manual mode, one flat-field correction, shutter open afterwards ---
+    if (!cam->setNUCUpdateMode(wic::NUCUpdateModes::Manual).isOk()) {
+        std::cerr << "[ERROR] Failed to set manual NUC mode.\n";
+        return 4;
+    }
+    if (cam->setIntegratedNUCUpdateFrames(wic::IntegratedNUCUpdateFrames::Frames16) !=
+        wic::ResponseStatus::Ok) {
+        std::cerr << "[ERROR] Failed to set integrated NUC frames.\n";
+        return 4;
+    }
+    std::cout << "[INFO] Flat-field correction: the shutter closes for about 5 s\n";
+    double ffcAnchorC = NAN;
+    if (!runFlatField(cam, ffcAnchorC)) {
+        return 4;
+    }
+
+    auto sensorRead = cam->getCameraTemperature(wic::CameraTemperature::SensorTemp);
+    double sensorTempC = sensorRead.isOk() ? sensorRead.result : 0.0;
+    if (!sensorRead.isOk()) {
+        std::cerr << "[WARN] Could not read sensor temperature; calibrating with 0 C until it "
+                     "can be read\n";
+    }
+
+    // --- Window ---
+    cv::namedWindow(kWindow, cv::WINDOW_AUTOSIZE);
+    cv::setMouseCallback(kWindow, onMouse);
+    cv::createTrackbar(kPeakingTrackbar, kWindow, nullptr, 100);
+    cv::setTrackbarMin(kPeakingTrackbar, kWindow, 1);
+    cv::setTrackbarPos(kPeakingTrackbar, kWindow, kDefaultPeakingPercent);
+
+    // --- Capture loop ---
     auto grabber = cam->frameGrabber();
     grabber->setup();
+    std::vector<uint16_t> buffer(static_cast<size_t>(width) * height);
+    std::vector<float> temps(buffer.size());
+    std::vector<float> scratch;
+    const cv::Mat tempMat(height, width, CV_32F, temps.data());  // view of temps, no copy
+    const cv::Mat lut = paletteLut();
+    cv::Mat gray8, image, blurred, gx, gy, gradient;
 
-    // Variable holding raw values of the camera
-    std::vector<uint16_t> buffer;
-    buffer.resize(grabber->getRequiredBufferSize() / 2);
+    bool peaking = true;
+    double sharpness = -1.0;  // mK/px, smoothed over frames; < 0 until the first frame
+    double bestSharpness = 0.0;
+    int exitCode = 0;
 
-    // Camera core temperature for calibration of raw data
-    auto coreTemp = cam->getCameraTemperature(wic::CameraTemperature::SensorTemp);
-
-    wic::FrameGrabberError error;
-
-    // Main loop which grabs raw data from the camera and show them in video stream 
-    while (true) {
+    for (int frame = 0;; ++frame) {
+        wic::FrameGrabberError error;
         grabber->getBuffer(reinterpret_cast<uint8_t*>(buffer.data()), error, 5000);
         if (error != wic::FrameGrabberError::None) {
-            std::cerr << "getBuffer ended with error" << std::endl;
+            std::cerr << "[ERROR] Frame grabber error at frame " << frame << ".\n";
+            exitCode = 6;
             break;
         }
-        bufferHandler(buffer, coreTemp.result, 1000 / 60);
+
+        if (frame % kSensorTempRefreshFrames == 0) {
+            auto s = cam->getCameraTemperature(wic::CameraTemperature::SensorTemp);
+            if (s.isOk()) sensorTempC = s.result;
+        }
+        cam->calibrateRawInplace(buffer.data(), buffer.size(), sensorTempC);
+        for (size_t i = 0; i < buffer.size(); ++i) {
+            temps[i] = static_cast<float>(wic::rawToCelsius(buffer[i], tempRes));
+        }
+
+        // Color image
+        const auto [lowC, highC] = displayRange(temps, scratch);
+        const double spanC = highC - lowC;
+        tempMat.convertTo(gray8, CV_8U, 255.0 / spanC, -lowC * 255.0 / spanC);
+        cv::applyColorMap(gray8, image, lut);
+
+        // Temperature gradient in C per pixel. The light blur keeps sensor noise
+        // from showing up as peaking; the 1/8 turns the Sobel response into C/px.
+        cv::GaussianBlur(tempMat, blurred, cv::Size(3, 3), 0);
+        cv::Sobel(blurred, gx, CV_32F, 1, 0, 3, 1.0 / 8.0);
+        cv::Sobel(blurred, gy, CV_32F, 0, 1, 3, 1.0 / 8.0);
+        cv::magnitude(gx, gy, gradient);
+
+        const double rmsGradientMk = std::sqrt(cv::mean(gradient.mul(gradient))[0]) * 1000.0;
+        sharpness = (sharpness < 0) ? rmsGradientMk
+                                    : (1.0 - kSharpnessSmoothing) * sharpness +
+                                          kSharpnessSmoothing * rmsGradientMk;
+        bestSharpness = std::max(bestSharpness, sharpness);
+
+        const int peakingPercent = cv::getTrackbarPos(kPeakingTrackbar, kWindow);
+        if (peaking) {
+            const cv::Mat edges = gradient > (peakingPercent / 100.0) * spanC;
+            image.setTo(cv::Scalar(0, 255, 0), edges);
+        }
+
+        // Overlay
+        const bool nearBest = sharpness >= kNearBestFraction * bestSharpness;
+        drawText(image,
+                 "sharpness " + fixed(sharpness, 0) + " mK/px   best " + fixed(bestSharpness, 0),
+                 0, nearBest ? cv::Scalar(0, 255, 0) : cv::Scalar(255, 255, 255));
+        drawText(image,
+                 "display " + fixed(lowC, 1) + " .. " + fixed(highC, 1) + " C   sensor " +
+                     fixed(sensorTempC, 1) + " C",
+                 1);
+        if (mouseX >= 0 && mouseX < width && mouseY >= 0 && mouseY < height) {
+            drawText(image,
+                     "(" + std::to_string(mouseX) + ", " + std::to_string(mouseY) + ")  " +
+                         fixed(temps[static_cast<size_t>(mouseY) * width + mouseX], 2) + " C",
+                     2);
+        }
+        drawText(image,
+                 std::string("peaking ") + (peaking ? std::to_string(peakingPercent) + "%" : "off") +
+                     "   p: peaking  r: reset best  q: quit",
+                 (height - 28) / 20);
+
+        cv::imshow(kWindow, image);
+        const int key = cv::waitKey(1) & 0xFF;
+        if (key == 'q' || key == 27) break;
+        if (key == 'p') peaking = !peaking;
+        if (key == 'r') bestSharpness = sharpness;
+        if (cv::getWindowProperty(kWindow, cv::WND_PROP_VISIBLE) < 1) break;  // window closed
     }
+    cv::destroyAllWindows();
+    return exitCode;
 }
